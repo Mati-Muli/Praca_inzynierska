@@ -1,157 +1,178 @@
 import os
 os.environ["HF_HOME"] = "E:/huggingface_cache"
 import sys
+import argparse
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.nn import CrossEntropyLoss
 from tqdm import tqdm
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from transformers import get_cosine_schedule_with_warmup
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from TOKEN import HF_TOKEN
 from src.dataset import DatasetLoad
-from src.bridge import MedicalVLM
+from src.bridge import MedicalVLM, NUM_PATCHES
+
+REPORTS_CSV = "E:/Praca_inzynierska/data/indiana_reports.csv"
+PROJECTIONS_CSV = "E:/Praca_inzynierska/data/indiana_projections.csv"
+IMAGES_DIR = "E:/Praca_inzynierska/data/images/images_normalized"
+
+CKPT_DIR = "E:/Praca_inzynierska/checkpoints"
+MLP_PATH = os.path.join(CKPT_DIR, "wagi_mlp.pt")
+LORA_PATH = os.path.join(CKPT_DIR, "lora_adaptery")
+
+# zdefiniowany prompt i maxymalan długość
+PROMPT = ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+          "You are an expert radiologist. Describe the findings in this chest X-ray."
+          "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
+MAX_LEN = 384
 
 
 def train():
-    REPORTS_CSV = "E:/Praca_inzynierska/data/indiana_reports.csv"
-    PROJECTIONS_CSV = "E:/Praca_inzynierska/data/indiana_projections.csv"
-    IMAGES_DIR = "E:/Praca_inzynierska/data/images/images_normalized"
+    parser = argparse.ArgumentParser(description="Trening MedicalVLM (MLP / LoRA / Both)")
+    parser.add_argument("--stage", type=str, choices=['mlp', 'lora', 'both'], required=True)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--resume_mlp", action="store_true")
+    args = parser.parse_args()
 
-    EPOCHS = 3
-    BATCH_SIZE = 2
-    LR = 1e-4
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    print(f"\n{'=' * 50}\nURUCHOMIENIE UCZENIA | TRYB: {args.stage.upper()}\n{'=' * 50}\n")
 
-    print(f"\n{'=' * 50}")
-    print("URUCHOMIENIE UCZENIA | MLP")
-    print(f"{'=' * 50}\n")
-
-    train_dataset = DatasetLoad(
-        reports_csv=REPORTS_CSV,
-        projections_csv=PROJECTIONS_CSV,
-        images_dir=IMAGES_DIR,
-        split='train',
-        is_training=True
-    )
-
-    val_dataset = DatasetLoad(
-        reports_csv=REPORTS_CSV,
-        projections_csv=PROJECTIONS_CSV,
-        images_dir=IMAGES_DIR,
-        split='val',
-        is_training=False
-    )
-
+    train_dataset = DatasetLoad(REPORTS_CSV, PROJECTIONS_CSV, IMAGES_DIR, split='train', is_training=True)
+    val_dataset = DatasetLoad(REPORTS_CSV, PROJECTIONS_CSV, IMAGES_DIR, split='val', is_training=False)
     print(f"Dane: Trening={len(train_dataset)}, Walidacja={len(val_dataset)}")
 
     model = MedicalVLM(hf_token=HF_TOKEN)
+    dev = model.llm.device
 
-    try:
-        model.connector.load_state_dict(torch.load("wagi_mlp.pt", weights_only=True))
-        print("Znaleziono bazowe wagi MLP")
-    except FileNotFoundError:
-        print("Brak poprzednich wag.")
+    # sprawdzanie ucinania
+    prompt_len = len(model.tokenizer(PROMPT, add_special_tokens=False)["input_ids"])
+    lens = [len(model.tokenizer(PROMPT + t + "<|eot_id|>", add_special_tokens=False)["input_ids"])
+            for t in train_dataset.file["findings"].astype(str)]
+    too_long = sum(l > MAX_LEN for l in lens)
+    print(f"Długość sekwencji: max={max(lens)}, średnia={sum(lens) / len(lens):.0f}, "
+          f"ponad {MAX_LEN} tokenów: {too_long}")
+    if too_long:
+        print("Zwiększ MAX_LEN.")
 
-    for param in model.connector.parameters():
-        param.requires_grad = True
+    # ładowanie istniejących wag
+    load_mlp = args.stage in ['lora', 'both'] or args.resume_mlp
+    if os.path.exists(MLP_PATH) and load_mlp:
+        model.connector.load_state_dict(torch.load(MLP_PATH, map_location=dev, weights_only=True))
+        print("\nZaładowano wagi MLP.")
+    elif args.stage == 'lora':
+        print(f"\nBrak '{MLP_PATH}'.")
+        sys.exit(1)
+    else:
+        print("\nStart MLP od zera.")
 
-    # optimizer Adam
-    optimizer = torch.optim.AdamW(model.connector.parameters(), lr=LR)
+    # zamrażanie/odmrażanie - wybór uczenia
+    groups = []
+    if args.stage in ['mlp', 'both']:
+        for p in model.connector.parameters():
+            p.requires_grad = True
+        groups.append({"params": list(model.connector.parameters()), "lr": 1e-4})
+    else:
+        for p in model.connector.parameters():
+            p.requires_grad = False
 
+    if args.stage in ['lora', 'both']:
+        model.llm = prepare_model_for_kbit_training(model.llm)
+        lora_config = LoraConfig(
+            r=16, lora_alpha=32,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM
+        )
+        model.llm = get_peft_model(model.llm, lora_config)
+        model.llm.print_trainable_parameters()
+        groups.append({"params": [p for p in model.llm.parameters() if p.requires_grad], "lr": 2e-4})
+    else:
+        print("LLM zamrożony.")
+
+    all_params = [p for g in groups for p in g["params"]]
+
+    # tworzenie batchy
     def collate_fn(batch):
-        images = torch.stack([item[0] for item in batch])
-        texts = [item[1] for item in batch]
+        images = torch.stack([b[0] for b in batch])
+        full_texts = [PROMPT + b[1] + "<|eot_id|>" for b in batch]
+        tok = model.tokenizer(full_texts, padding=True, truncation=True, max_length=MAX_LEN, add_special_tokens=False, return_tensors="pt")
+        labels = tok["input_ids"].clone()
+        labels[:, :prompt_len] = -100                  # prompt nie wchodzi do loss
+        labels[tok["attention_mask"] == 0] = -100      # padding
+        return images, tok["input_ids"], tok["attention_mask"], labels
 
-        # konstruckja promptu
-        prompts = [
-            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nYou are an expert radiologist. Describe the findings in this chest X-ray.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            for _ in texts
-        ]
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-        # pełn tekst
-        full_texts = [p + t + "<|eot_id|>" for p, t in zip(prompts, texts)]
+    # obliczanie straty
+    def compute_loss(images, input_ids, attention_mask, labels):
+        out = model(images, input_ids, attention_mask)
+        ignore = torch.full((images.shape[0], NUM_PATCHES), -100, dtype=labels.dtype, device=labels.device)
+        full_labels = torch.cat([labels[:, :1], ignore, labels[:, 1:]], dim=1)
+        logits = out.logits[:, :-1].float()
+        targets = full_labels[:, 1:]
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
 
-        tokenized_full = model.tokenizer(full_texts, padding=True, truncation=True, max_length=256, return_tensors="pt")
+    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
+    total_steps = max(1, (len(train_loader) // args.grad_accum) * args.epochs)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, int(0.05 * total_steps), total_steps)
 
-        # obliczenie długości promptu do maskowania
-        tokenized_prompts = model.tokenizer(prompts, add_special_tokens=False)
-        prompt_lengths = [len(p) for p in tokenized_prompts["input_ids"]]
+    # zapis wag
+    def save_models():
+        if args.stage in ['mlp', 'both']:
+            torch.save(model.connector.state_dict(), MLP_PATH)
+            print(f"Zapisano konektor {MLP_PATH}")
+        if args.stage in ['lora', 'both']:
+            model.llm.save_pretrained(LORA_PATH)
+            print(f"Zapisano adaptery {LORA_PATH}")
 
-        return images, tokenized_full["input_ids"], tokenized_full["attention_mask"], prompt_lengths
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-    loss_fn = CrossEntropyLoss(ignore_index=-100)
-
-    # uczenie
+    # główna pętla uczenia
+    best_val = float("inf")
     try:
-        for epoch in range(EPOCHS):
-            print(f"\n--- EPOKA {epoch + 1}/{EPOCHS} ---")
-
+        for epoch in range(args.epochs):
+            print(f"\n--- EPOKA {epoch + 1}/{args.epochs} ---")
             model.train()
-            total_train_loss = 0
-            train_bar = tqdm(train_loader, desc="Uczenie")
+            total_train = 0.0
+            optimizer.zero_grad()
+            bar = tqdm(train_loader, desc=f"Uczenie ({args.stage})")
 
-            for step, (images, input_ids, attention_mask, prompt_lengths) in enumerate(train_bar):
-                images = images.to(model.llm.device)
-                input_ids = input_ids.to(model.llm.device)
-                attention_mask = attention_mask.to(model.llm.device)
-                optimizer.zero_grad()
-                outputs = model(images, input_ids, attention_mask)
-                logits = outputs.logits
+            for step, (images, input_ids, attention_mask, labels) in enumerate(bar):
+                images, input_ids = images.to(dev), input_ids.to(dev)
+                attention_mask, labels = attention_mask.to(dev), labels.to(dev)
 
-                full_labels = torch.full((images.shape[0], 196 + input_ids.shape[1]), -100, dtype=torch.long, device=model.llm.device)
-                full_labels[:, 196:] = input_ids.clone()
+                loss = compute_loss(images, input_ids, attention_mask, labels)
+                (loss / args.grad_accum).backward()
 
-                # maskowanie
-                full_labels[full_labels == model.tokenizer.pad_token_id] = -100
+                if (step + 1) % args.grad_accum == 0 or (step + 1) == len(train_loader):
+                    torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-                # maskowanie
-                for i, p_len in enumerate(prompt_lengths):
-                    full_labels[i, 196: 196 + p_len] = -100
+                total_train += loss.item()
+                bar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_labels = full_labels[:, 1:].contiguous()
+            avg_train = total_train / len(train_loader)
 
-                loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss.backward()
-                optimizer.step()
-
-                total_train_loss += loss.item()
-                train_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-            avg_train_loss = total_train_loss / len(train_loader)
-
-            # walidacja
             model.eval()
-            total_val_loss = 0
+            total_val = 0.0
             with torch.no_grad():
-                for images, input_ids, attention_mask, prompt_lengths in val_loader:
-                    images, input_ids, attention_mask = images.to(model.llm.device), input_ids.to(model.llm.device), attention_mask.to(model.llm.device)
-                    outputs = model(images, input_ids, attention_mask)
-                    logits = outputs.logits
-                    full_labels = torch.full((images.shape[0], 196 + input_ids.shape[1]), -100, dtype=torch.long, device=model.llm.device)
-                    full_labels[:, 196:] = input_ids.clone()
-                    full_labels[full_labels == model.tokenizer.pad_token_id] = -100
-                    for i, p_len in enumerate(prompt_lengths):
-                        full_labels[i, 196: 196 + p_len] = -100
+                for images, input_ids, attention_mask, labels in val_loader:
+                    images, input_ids = images.to(dev), input_ids.to(dev)
+                    attention_mask, labels = attention_mask.to(dev), labels.to(dev)
+                    total_val += compute_loss(images, input_ids, attention_mask, labels).item()
+            avg_val = total_val / len(val_loader)
 
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = full_labels[:, 1:].contiguous()
-
-                    loss = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                    total_val_loss += loss.item()
-                    train_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-            avg_val_loss = total_val_loss / len(val_loader)
-
-            print(f"Epoka {epoch + 1}: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")
-            torch.save(model.connector.state_dict(), "wagi_mlp.pt")
-            print("Zapisano wagi 'wagi_mlp.pt'.")
+            print(f"Epoka {epoch + 1}: Train Loss = {avg_train:.4f} | Val Loss = {avg_val:.4f}")
+            if avg_val < best_val:
+                best_val = avg_val
+                print(f"Best val loss: {best_val:.4f}")
+                save_models()
 
     except KeyboardInterrupt:
-        print("\n\n[!] Przerwanie ręcznie.")
-        torch.save(model.connector.state_dict(), "wagi_mlp.pt")
-        print("Zapisano wagi 'wagi_mlp.pt'.")
+        print("\nPrzerwano ręcznie.")
 
 
 if __name__ == "__main__":
