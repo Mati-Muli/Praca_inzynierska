@@ -21,9 +21,9 @@ PROMPT = ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
           "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
 
 
-def main(sample_idx=0):
+def main(sample_idx=195):
     print("Ładowanie modelu...")
-    model = MedicalVLM(hf_token=HF_TOKEN, attn_impl="eager")
+    model = MedicalVLM(hf_token=HF_TOKEN, atten="eager")
     dev = model.llm.device
 
     model.connector.load_state_dict(torch.load(MLP_PATH, map_location=dev, weights_only=True))
