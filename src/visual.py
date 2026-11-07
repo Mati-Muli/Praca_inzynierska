@@ -24,7 +24,6 @@ def gen_heatmap(attentions, img_path):
 
     # normalizacja kolorów
     heatmap_14x14 = (heatmap_14x14 - heatmap_14x14.min()) / (heatmap_14x14.max() - heatmap_14x14.min() + 1e-8)
-
     orig_img = cv2.imread(img_path)
     if orig_img is None:
         raise FileNotFoundError(f"Nie znaleziono obrazu: {img_path}")
@@ -33,6 +32,8 @@ def gen_heatmap(attentions, img_path):
 
     # tworzenie maski
     heatmap_resized = cv2.resize(heatmap_14x14, (224, 224), interpolation=cv2.INTER_CUBIC)
+    heatmap_resized = cv2.GaussianBlur(heatmap_resized, (15, 15), 0)
+    heatmap_resized[heatmap_resized < 0.05] = 0
     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
     heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
 
