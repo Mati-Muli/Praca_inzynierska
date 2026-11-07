@@ -1,4 +1,5 @@
 import os
+
 os.environ["HF_HOME"] = "E:/huggingface_cache"
 import sys
 import argparse
@@ -21,7 +22,6 @@ CKPT_DIR = "E:/Praca_inzynierska/checkpoints"
 MLP_PATH = os.path.join(CKPT_DIR, "wagi_mlp.pt")
 LORA_PATH = os.path.join(CKPT_DIR, "lora_adaptery")
 
-# zdefiniowany prompt i maxymalan długość
 PROMPT = ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
           "You are an expert radiologist. Describe the findings in this chest X-ray."
           "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
@@ -31,7 +31,7 @@ MAX_LEN = 384
 def train():
     parser = argparse.ArgumentParser(description="Trening MedicalVLM (MLP / LoRA / Both)")
     parser.add_argument("--stage", type=str, choices=['mlp', 'lora', 'both'], required=True)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--resume_mlp", action="store_true")
@@ -42,20 +42,23 @@ def train():
 
     train_dataset = DatasetLoad(REPORTS_CSV, PROJECTIONS_CSV, IMAGES_DIR, split='train', is_training=True)
     val_dataset = DatasetLoad(REPORTS_CSV, PROJECTIONS_CSV, IMAGES_DIR, split='val', is_training=False)
-    print(f"Dane: Trening={len(train_dataset)}, Walidacja={len(val_dataset)}")
+    print(f"Dane po balansie: Trening={len(train_dataset)}, Walidacja={len(val_dataset)}")
 
     model = MedicalVLM(hf_token=HF_TOKEN)
     dev = model.llm.device
 
-    # sprawdzanie ucinania
     prompt_len = len(model.tokenizer(PROMPT, add_special_tokens=False)["input_ids"])
-    lens = [len(model.tokenizer(PROMPT + t + "<|eot_id|>", add_special_tokens=False)["input_ids"])
-            for t in train_dataset.file["findings"].astype(str)]
+
+    lens = []
+    for t in train_dataset.file["findings"]:
+        text_str = str(t).strip()
+        tokens = model.tokenizer(PROMPT + text_str + "<|eot_id|>", add_special_tokens=False)["input_ids"]
+        lens.append(len(tokens))
     too_long = sum(l > MAX_LEN for l in lens)
-    print(f"Długość sekwencji: max={max(lens)}, średnia={sum(lens) / len(lens):.0f}, "
+    print(f"Długość sekwencji: max={max(lens)}, średnia={sum(lens) / max(1, len(lens)):.0f}, "
           f"ponad {MAX_LEN} tokenów: {too_long}")
-    if too_long:
-        print("Zwiększ MAX_LEN.")
+    if too_long > 0:
+        print(f"Uwaga: {too_long} raportów zostanie przyciętych do {MAX_LEN} tokenów.")
 
     # ładowanie istniejących wag
     load_mlp = args.stage in ['lora', 'both'] or args.resume_mlp
@@ -63,7 +66,7 @@ def train():
         model.connector.load_state_dict(torch.load(MLP_PATH, map_location=dev, weights_only=True))
         print("\nZaładowano wagi MLP.")
     elif args.stage == 'lora':
-        print(f"\nBrak '{MLP_PATH}'.")
+        print(f"\nBrak '{MLP_PATH}'. Najpierw wytrenuj MLP!")
         sys.exit(1)
     else:
         print("\nStart MLP od zera.")
@@ -96,17 +99,18 @@ def train():
     # tworzenie batchy
     def collate_fn(batch):
         images = torch.stack([b[0] for b in batch])
-        full_texts = [PROMPT + b[1] + "<|eot_id|>" for b in batch]
-        tok = model.tokenizer(full_texts, padding=True, truncation=True, max_length=MAX_LEN, add_special_tokens=False, return_tensors="pt")
+        full_texts = [PROMPT + str(b[1]) + "<|eot_id|>" for b in batch]
+        tok = model.tokenizer(full_texts, padding=True, truncation=True, max_length=MAX_LEN, add_special_tokens=False,
+                              return_tensors="pt")
         labels = tok["input_ids"].clone()
-        labels[:, :prompt_len] = -100                  # prompt nie wchodzi do loss
-        labels[tok["attention_mask"] == 0] = -100      # padding
+        labels[:, :prompt_len] = -100  # prompt nie wchodzi do loss
+        labels[tok["attention_mask"] == 0] = -100  # padding
         return images, tok["input_ids"], tok["attention_mask"], labels
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # obliczanie straty
+    # Obliczanie straty
     def compute_loss(images, input_ids, attention_mask, labels):
         out = model(images, input_ids, attention_mask)
         ignore = torch.full((images.shape[0], NUM_PATCHES), -100, dtype=labels.dtype, device=labels.device)
@@ -119,7 +123,7 @@ def train():
     total_steps = max(1, (len(train_loader) // args.grad_accum) * args.epochs)
     scheduler = get_cosine_schedule_with_warmup(optimizer, int(0.05 * total_steps), total_steps)
 
-    # zapis wag
+    # Zapis wag
     def save_models():
         if args.stage in ['mlp', 'both']:
             torch.save(model.connector.state_dict(), MLP_PATH)
@@ -128,7 +132,7 @@ def train():
             model.llm.save_pretrained(LORA_PATH)
             print(f"Zapisano adaptery {LORA_PATH}")
 
-    # główna pętla uczenia
+    # Główna pętla uczenia
     best_val = float("inf")
     try:
         for epoch in range(args.epochs):

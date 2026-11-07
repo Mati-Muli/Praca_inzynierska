@@ -17,7 +17,6 @@ def get_transforms(is_training=False, use_clahe=True):
             al.Rotate(limit=15, p=0.5, border_mode=cv2.BORDER_CONSTANT)
         )
 
-    # średnia/odchylenie CLIP - zgodne z BiomedCLIP
     transforms_list.extend([
         al.Normalize(
             mean=[0.48145466, 0.4578275, 0.40821073],
@@ -55,8 +54,19 @@ class DatasetLoad(Dataset):
         train_uids, temp_uids = train_test_split(unique_uids, test_size=0.2, random_state=42)
         val_uids, test_uids = train_test_split(temp_uids, test_size=0.5, random_state=42)
 
+        ''' Balansowanie datasetu pod uczenie'''
+        ''' Sortowanie po wynikach normalnych w MeSH dla znalezienia odwrotności'''
         if split == 'train':
             df_selected = df_all[df_all['uid'].isin(train_uids)]
+            mesh_col = df_selected['MeSH'].fillna('normal').astype(str).str.lower()
+            is_normal = mesh_col.str.contains('normal')
+            df_normal = df_selected[is_normal]
+            df_abnormal = df_selected[~is_normal]
+            print(f"Przed balansem: Zdrowi: {len(df_normal)}, Chorzy: {len(df_abnormal)}")
+            df_normal_sampled = df_normal.sample(n=min(len(df_normal), len(df_abnormal)), random_state=42)
+            df_selected = pd.concat([df_normal_sampled, df_abnormal]).sample(frac=1, random_state=42)
+            print(f"Po balansie: Zdrowi: {len(df_normal_sampled)}, Chorzy: {len(df_abnormal)}")
+
         elif split == 'val':
             df_selected = df_all[df_all['uid'].isin(val_uids)]
         elif split == 'test':
@@ -74,12 +84,10 @@ class DatasetLoad(Dataset):
     def __getitem__(self, idx):
         row = self.file.iloc[idx]
         img_path = os.path.join(self.images_dir, row['filename'])
-
         image = cv2.imread(img_path)
         if image is None:
             raise FileNotFoundError(f"Nie znaleziono pliku obrazu: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
         image_tensor = self.transform(image=image)['image']
         findings = str(row['findings']).strip()
         return image_tensor, findings

@@ -6,7 +6,7 @@ import open_clip
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # stała liczba tokenów obrazu dla modelu ViT
-NUM_PATCHES = 196
+NUM_PATCHES = 197
 
 # konektor (tłumaczy wektory obrazu na język LLaMY)
 class MLP(nn.Module):
@@ -23,7 +23,7 @@ class MLP(nn.Module):
 
 
 class MedicalVLM(nn.Module):
-    def __init__(self, hf_token, in_features=768, out_features=4096):
+    def __init__(self, hf_token, in_features=768, out_features=4096,  atten=None):
         super(MedicalVLM, self).__init__()
 
         # BiomedCLIP
@@ -41,7 +41,7 @@ class MedicalVLM(nn.Module):
         self.connector = MLP(in_features=in_features, out_features=out_features)
 
         # LLM
-        llm_path = "meta-llama/Meta-Llama-3-8B-Instruct"
+        llm_path = "meta-llama/Llama-3.1-8B-Instruct" # Gemma 4 - test
         print(f"Ładowanie LLM ({llm_path})...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(llm_path, token=hf_token)
@@ -65,7 +65,8 @@ class MedicalVLM(nn.Module):
             dtype=torch.bfloat16,
             device_map="auto",
             quantization_config=quantization_config,
-            token=hf_token
+            token=hf_token,
+            attn_implementation=atten
         )
 
         # zamrożenie wag LLaMY przed dodaniem adapterów
@@ -83,13 +84,9 @@ class MedicalVLM(nn.Module):
         return self
 
     def _build_inputs(self, images, text_input_ids, attention_mask):
-        # wyciągnięcie i normalizacja łatek obrazu
         with torch.no_grad():
-            vf = self.vision_model.visual.trunk.forward_features(images)
-            patch = vf[:, 1:, :]
-            patch = patch / patch.norm(dim=-1, keepdim=True)
+            patch = self.vision_model.visual.trunk.forward_features(images)
 
-        # przepuszczenie przez konektor
         image_embeds = self.connector(patch.float()).to(self.llm.dtype)
 
         with torch.no_grad():
@@ -100,11 +97,9 @@ class MedicalVLM(nn.Module):
             [text_embeds[:, :1, :], image_embeds, text_embeds[:, 1:, :]], dim=1
         )
 
-        # wymuszenie gradientu dla LoRa
         if self.training and not inputs_embeds.requires_grad:
             inputs_embeds.requires_grad_(True)
 
-        # budowanie attention maski
         if attention_mask is not None:
             image_mask = torch.ones((attention_mask.shape[0], NUM_PATCHES), dtype=attention_mask.dtype, device=attention_mask.device)
             attention_mask = torch.cat(
@@ -112,7 +107,6 @@ class MedicalVLM(nn.Module):
             )
         return inputs_embeds, attention_mask
 
-    # przejście w przód - liczenie logits dla straty
     def forward(self, images, text_input_ids, attention_mask=None):
         inputs_embeds, attention_mask = self._build_inputs(images, text_input_ids, attention_mask)
         return self.llm(
