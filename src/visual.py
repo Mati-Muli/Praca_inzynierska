@@ -40,10 +40,10 @@ def gen_heatmap(attentions, img_path):
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     axes[0].imshow(orig_img)
-    axes[0].set_title("Oryginalne zdjęcie RTG", fontweight='bold')
+    axes[0].set_title("Oryginalne zdjęcie", fontweight='bold')
     axes[0].axis("off")
     axes[1].imshow(overlay)
-    axes[1].set_title("Mapa Atencji (Wyjaśnialność LLM)", fontweight='bold')
+    axes[1].set_title("Heatmap", fontweight='bold')
     axes[1].axis("off")
     plt.tight_layout()
     plt.show()
