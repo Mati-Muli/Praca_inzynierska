@@ -1,7 +1,10 @@
 import os
+
 os.environ["HF_HOME"] = "E:/huggingface_cache"
 import sys
 import torch
+import matplotlib.pyplot as plt  # DODANY IMPORT
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from TOKEN import HF_TOKEN
 from src.dataset import DatasetLoad
@@ -17,11 +20,11 @@ MLP_PATH = os.path.join(CKPT_DIR, "wagi_mlp.pt")
 LORA_PATH = os.path.join(CKPT_DIR, "lora_adaptery")
 
 PROMPT = ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-          "You are an expert radiologist. Analyze this chest X-ray and give detailed raport. Report any external device present in the body"
+          "You are an expert radiologist. Analyze this chest X-ray and give detailed raport."
           "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
 
 
-def main(sample_idx=195):
+def main(sample_idx=192):
     print("Ładowanie modelu...")
     model = MedicalVLM(hf_token=HF_TOKEN, atten="eager")
     dev = model.llm.device
@@ -59,13 +62,17 @@ def main(sample_idx=195):
     output_ids = output.sequences[0]
     generated = model.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
 
+    # POPRAWIONE ZNAKI MNOŻENIA "*"
     print("\n" + "=" * 50 + "\nPRAWDZIWY RAPORT:\n" + true_report)
     print("\n" + "=" * 50 + "\nWYGENEROWANY RAPORT:\n" + generated)
     print("=" * 50 + "\n")
 
     row = dataset.file.iloc[sample_idx]
     img_path = os.path.join(IMAGES_DIR, row['filename'])
-    gen_heatmap(output.attentions, img_path)
+
+    # Odbieramy obiekt figury z funkcji i wywołujemy plt.show()
+    fig = gen_heatmap(output.attentions, img_path)
+    plt.show()
 
 
 if __name__ == "__main__":

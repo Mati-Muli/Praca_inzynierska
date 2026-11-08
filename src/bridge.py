@@ -15,7 +15,7 @@ class MLP(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(in_features, out_features),
             nn.GELU(),
-            nn.Linear(out_features, out_features),
+            nn.Linear(out_features, out_features)
         )
 
     def forward(self, x):
