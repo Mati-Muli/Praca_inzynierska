@@ -1,5 +1,5 @@
 import os
-
+from peft import PeftModel
 os.environ["HF_HOME"] = "E:/huggingface_cache"
 import sys
 import argparse
@@ -23,7 +23,7 @@ MLP_PATH = os.path.join(CKPT_DIR, "wagi_mlp.pt")
 LORA_PATH = os.path.join(CKPT_DIR, "lora_adaptery")
 
 PROMPT = ("<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-          "You are an expert radiologist. Describe the findings in this chest X-ray."
+          "You are an expert radiologist. Analyze this chest X-ray and give detailed raport."
           "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n")
 MAX_LEN = 384
 
@@ -33,7 +33,7 @@ def train():
     parser.add_argument("--stage", type=str, choices=['mlp', 'lora', 'both'], required=True)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--grad_accum", type=int, default=16)
     parser.add_argument("--resume_mlp", action="store_true")
     args = parser.parse_args()
 
@@ -46,6 +46,33 @@ def train():
 
     model = MedicalVLM(hf_token=HF_TOKEN)
     dev = model.llm.device
+
+    vocab_size = model.llm.config.vocab_size
+    loss_weights = torch.ones(vocab_size, device=dev)
+
+    # słownik słów do kar
+    keywords = [
+        "cardiomegaly", "enlarged", "effusion", "effusions", "pneumothorax",
+        "pneumothoraces", "opacity", "opacities", "consolidation", "consolidations",
+        "edema", "atelectasis", "infiltrate", "infiltrates", "nodule", "nodules",
+        "mass", "masses", "scarring", "cicatrix", "calcified", "granuloma",
+        "granulomas", "calcinosis", "atherosclerosis", "tortuous", "tortuosity",
+        "hernia", "hiatal", "hypoinflation", "hyperinflation", "hyperdistention",
+        "blunting", "blunted", "prominence", "prominent", "congestion",
+        "interstitial", "disease", "pneumonia", "deformity", "fracture",
+        "surgical", "clips", "hardware", "device", "catheter", "pacemaker",
+        "degenerative", "osteophytes", "sclerotic", "thickening", "pleural",
+        "airspace", "abnormality", "abnormalities", "scar", "scars"
+    ]
+
+    Penalty = 10.0
+
+    for word in keywords:
+        for variant in [word, " " + word, word.capitalize(), " " + word.capitalize(), word.upper(), " " + word.upper()]:
+            tokens = model.tokenizer.encode(variant, add_special_tokens=False)
+            for t_id in tokens:
+                loss_weights[t_id] = Penalty
+    print(f"Zainicjalizowano wagi straty dla {len(keywords)} słów kluczowych (mnożnik x{Penalty}).")
 
     prompt_len = len(model.tokenizer(PROMPT, add_special_tokens=False)["input_ids"])
 
@@ -76,7 +103,7 @@ def train():
     if args.stage in ['mlp', 'both']:
         for p in model.connector.parameters():
             p.requires_grad = True
-        groups.append({"params": list(model.connector.parameters()), "lr": 1e-4})
+        groups.append({"params": list(model.connector.parameters()), "lr": 5e-4})
     else:
         for p in model.connector.parameters():
             p.requires_grad = False
@@ -84,13 +111,20 @@ def train():
     if args.stage in ['lora', 'both']:
         model.llm = prepare_model_for_kbit_training(model.llm)
         lora_config = LoraConfig(
-            r=16, lora_alpha=32,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM
+            r=32, lora_alpha=64,
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0.1, bias="none", task_type=TaskType.CAUSAL_LM
         )
-        model.llm = get_peft_model(model.llm, lora_config)
+
+        if os.path.exists(os.path.join(LORA_PATH, "adapter_model.safetensors")):
+            print(f"\nWznawianie treningu LoRA z {LORA_PATH}...")
+            model.llm = PeftModel.from_pretrained(model.llm, LORA_PATH, is_trainable=True)
+        else:
+            print("\nTworzenie nowych adapterów LoRA od zera.")
+            model.llm = get_peft_model(model.llm, lora_config)
+
         model.llm.print_trainable_parameters()
-        groups.append({"params": [p for p in model.llm.parameters() if p.requires_grad], "lr": 2e-4})
+        groups.append({"params": [p for p in model.llm.parameters() if p.requires_grad], "lr": 2e-5})
     else:
         print("LLM zamrożony.")
 
@@ -110,18 +144,30 @@ def train():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # Obliczanie straty
+    # Obliczanie straty z wykorzystaniem loss_weights
     def compute_loss(images, input_ids, attention_mask, labels):
         out = model(images, input_ids, attention_mask)
         ignore = torch.full((images.shape[0], NUM_PATCHES), -100, dtype=labels.dtype, device=labels.device)
         full_labels = torch.cat([labels[:, :1], ignore, labels[:, 1:]], dim=1)
         logits = out.logits[:, :-1].float()
         targets = full_labels[:, 1:]
-        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=-100,
+            weight=loss_weights
+        )
 
     optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
+
     total_steps = max(1, (len(train_loader) // args.grad_accum) * args.epochs)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, int(0.05 * total_steps), total_steps)
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.03 * total_steps),
+        num_training_steps=total_steps
+    )
 
     # Zapis wag
     def save_models():
