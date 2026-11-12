@@ -8,14 +8,21 @@ from albumentations.pytorch import ToTensorV2
 
 
 def get_transforms(is_training=False, use_clahe=True):
-    transforms_list = [al.Resize(224, 224)]
+    transforms_list = []
+
     if use_clahe:
         transforms_list.append(al.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0))
 
     if is_training:
-        transforms_list.append(
-            al.Rotate(limit=15, p=0.5, border_mode=cv2.BORDER_CONSTANT)
-        )
+        # większa augmenrtacja
+        transforms_list.extend([
+            al.RandomResizedCrop(224, 224, scale=(0.85, 1.0), p=1.0),
+            al.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, border_mode=cv2.BORDER_CONSTANT,
+                                p=0.5),
+            al.ColorJitter(brightness=0.2, contrast=0.2, p=0.5)
+        ])
+    else:
+        transforms_list.append(al.Resize(224, 224))
 
     transforms_list.extend([
         al.Normalize(
@@ -37,35 +44,48 @@ class DatasetLoad(Dataset):
         projections = pd.read_csv(projections_csv)
         df_all = pd.merge(reports, projections, on="uid", how="inner").dropna(subset=['findings'])
 
-        # same frontowe obrazy
+        # Same frontowe obrazy
         if frontal_only:
             df_all = df_all[df_all['projection'] == 'Frontal']
 
-        # czyszczenie textu - model za bardzo uczył się słowa cenzury jako coś normalnego (XXXX)
+        # Czyszczenie tekstu
         df_all = df_all.copy()
         df_all['findings'] = (df_all['findings'].astype(str)
                               .str.replace('XXXX', '', regex=False)
                               .str.replace(r'\s+', ' ', regex=True)
                               .str.strip())
         df_all = df_all[df_all['findings'].str.len() > 10]
+        df_all = df_all[~df_all['MeSH'].fillna('').astype(str).str.lower().str.contains('technical quality of image unsatisfactory')]
 
-        # podział po uid
+        # Podział po uid
         unique_uids = sorted(df_all['uid'].unique())
         train_uids, temp_uids = train_test_split(unique_uids, test_size=0.2, random_state=42)
         val_uids, test_uids = train_test_split(temp_uids, test_size=0.5, random_state=42)
 
-        ''' Balansowanie datasetu pod uczenie'''
-        ''' Sortowanie po wynikach normalnych w MeSH dla znalezienia odwrotności'''
+        ''' Balansowanie datasetu pod uczenie (Z użyciem oversamplingu dla mniejszościowych klas)'''
         if split == 'train':
             df_selected = df_all[df_all['uid'].isin(train_uids)]
             mesh_col = df_selected['MeSH'].fillna('normal').astype(str).str.lower()
             is_normal = mesh_col.str.contains('normal')
             df_normal = df_selected[is_normal]
             df_abnormal = df_selected[~is_normal]
-            print(f"Przed balansem: Zdrowi: {len(df_normal)}, Chorzy: {len(df_abnormal)}")
+
+            print(f"Przed balansem: Zdrowi: {len(df_normal)}, Chorzy (ogółem): {len(df_abnormal)}")
+
+            # downsampling
             df_normal_sampled = df_normal.sample(n=min(len(df_normal), len(df_abnormal)), random_state=42)
-            df_selected = pd.concat([df_normal_sampled, df_abnormal]).sample(frac=1, random_state=42)
-            print(f"Po balansie: Zdrowi: {len(df_normal_sampled)}, Chorzy: {len(df_abnormal)}")
+
+            # powielanie rzadszych chorób
+            rare_pathologies = ['edema', 'consolidation', 'atelectasis', 'pneumothorax', 'effusion', 'pneumonia']
+            oversampled_list = [df_normal_sampled, df_abnormal]
+
+            for pathology in rare_pathologies:
+                df_rare = df_abnormal[df_abnormal['MeSH'].fillna('').astype(str).str.lower().str.contains(pathology)]
+                if not df_rare.empty:
+                    df_rare_duplicated = df_rare.sample(n=len(df_rare) * 3, replace=True, random_state=42)
+                    oversampled_list.append(df_rare_duplicated)
+            df_selected = pd.concat(oversampled_list).sample(frac=1, random_state=42)
+            print(f"Po inżynierii balansu (oversampling): Zbiór gotowy do treningu zawiera {len(df_selected)} próbek.")
 
         elif split == 'val':
             df_selected = df_all[df_all['uid'].isin(val_uids)]
