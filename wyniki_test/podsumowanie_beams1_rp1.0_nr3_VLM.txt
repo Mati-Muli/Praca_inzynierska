@@ -1,0 +1,23 @@
+                  RAPORT Z EWALUACJI MODELU                 
+Konfiguracja      : beams1_rp1.0_nr3_VLM
+Liczba zdjęć      : 320
+bleu                              : 0.0696
+bleu_1                            : 0.2686
+bleu_2                            : 0.1591
+bleu_3                            : 0.1031
+rouge1                            : 0.3874
+rouge2                            : 0.1472
+rougeL                            : 0.2701
+f1chexbert_5_micro_f1             : 0.2394
+f1chexbert_all_micro_f1           : 0.2528
+f1chexbert_5_macro_f1             : 0.1512
+f1chexbert_all_macro_f1           : 0.1181
+f1chexbert_5_weighted_f1          : 0.2919
+f1chexbert_all_weighted_f1        : 0.2702
+[F1CHEXBERT_LABEL_SCORES_F1]
+  - f1chexbert_5                  : {'Cardiomegaly': 0.3404255319148936, 'Edema': 0.0, 'Consolidation': 0.0, 'Atelectasis': 0.30434782608695654, 'Pleural Effusion': 0.1111111111111111}
+  - f1chexbert_all                : {'Enlarged Cardiomediastinum': 0.23809523809523808, 'Cardiomegaly': 0.3404255319148936, 'Lung Opacity': 0.3125, 'Lung Lesion': 0.0, 'Edema': 0.0, 'Consolidation': 0.0, 'Pneumonia': 0.0, 'Atelectasis': 0.30434782608695654, 'Pneumothorax': 0.0, 'Pleural Effusion': 0.1111111111111111, 'Pleural Other': 0.0, 'Fracture': 0.0, 'Support Devices': 0.0, 'No Finding': 0.3465346534653465}
+
+bertscore_precision               : 0.8778
+bertscore_recall                  : 0.8883
+bertscore_f1                      : 0.8828
